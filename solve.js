@@ -40,12 +40,21 @@ function ensure(needed) {
 }
 
 /** The reading of one CSV input, {text, header}: {columns, rows, errors} (the header). */
+// The room the module needs for the results of one case: the fields, the rows, the errors and
+// the room for the answer. It goes right after the text, so it grows with the text.
+function room(len) {
+  const cap = (len >> 1) + 64;
+  const answer = Math.max(16 << 20, len * 3);
+  return { words: Math.ceil(cap * 5.25) + 65536 + Math.ceil(answer / 4) + 4096, answer };
+}
+
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
-  ensure(base + text.length * 2 + 8 * 1024 * 1024);
+  const r = room(text.length);
+  ensure(base + text.length * 2 + r.words * 4);
   new Uint8Array(memory.buffer).set(Buffer.from(text, 'utf16le'), base);
-  w.parse(base, text.length, header ? 1 : 0);
+  w.parse(base, text.length, header ? 1 : 0, r.words, r.answer);
   w.emit(base);
   outStart = w.out_buffer();
   outLength = w.out_length();
