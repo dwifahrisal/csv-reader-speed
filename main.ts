@@ -5,7 +5,7 @@ const { openSync, readFileSync, writeSync, mkdirSync, closeSync } = require('nod
 
 // Prioritize speed over comfort: disable V8 incremental marking.
 const { setFlagsFromString } = require('node:v8');
-setFlagsFromString('--no-incremental-marking --no-concurrent-recompilation');
+setFlagsFromString('--no-incremental-marking --no-concurrent-recompilation --liftoff-only --no-concurrent-marking --no-concurrent-sweeping --no-parallel-compaction');
 
 const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
