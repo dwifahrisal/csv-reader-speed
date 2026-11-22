@@ -1,0 +1,7 @@
+{
+  "name": "csv-reader-speed-01",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A WebAssembly CSV reader that reads like csv-reader 1.0.0."
+}

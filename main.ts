@@ -1,27 +1,26 @@
 // The program the harness runs: it reads every case from /input/cases.json, answers each one with
 // run() from solve.js, and writes /output/answers.json: a JSON array of the answers, one per case and
-// in the order of the cases.
+// in the same order.
 //
-// The answers are written as the text that the WebAssembly parser put together while it read the
-// cases, so the text is the answer and the value run() returns is the same answer.
-import { readFileSync, writeFileSync } from 'node:fs';
-import { Buffer } from 'node:buffer';
-import { setFlagsFromString } from 'node:v8';
+// The answer of a case is written out as it is read, so the answers never have to be held in memory
+// all at once: the module writes the JSON text of each answer, and it goes straight to the file.
+import { openSync, readFileSync, writeSync } from 'node:fs';
 
-setFlagsFromString('--no-incremental-marking');
-
-const { run, bytes } = await import('./solve.js');
+const { run, view } = await import('./solve.js');
 
 const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
 
 const cases = JSON.parse(readFileSync(`${inputDir}/cases.json`, 'utf8'));
-const parts = [Buffer.from('[')];
+
+const fd = openSync(`${outputDir}/answers.json`, 'w');
+writeSync(fd, '[');
+let first = true;
 for (const c of cases) {
-  run(c.input);
-  parts.push(bytes());
-  parts.push(Buffer.from(','));
+  const answer = run(c.input);
+  if (answer === undefined) throw new Error('a case has no answer');
+  if (!first) writeSync(fd, ',');
+  first = false;
+  writeSync(fd, view());
 }
-parts[parts.length - 1] = Buffer.from(']');
-const body = Buffer.concat(parts);
-writeFileSync(`${outputDir}/answers.json`, body);
+writeSync(fd, ']');
