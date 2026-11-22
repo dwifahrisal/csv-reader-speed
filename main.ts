@@ -3,6 +3,10 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { openSync, readFileSync, writeSync, mkdirSync, closeSync } = require('node:fs');
 
+// Prioritize speed over comfort: disable V8 incremental marking.
+const { setFlagsFromString } = require('node:v8');
+setFlagsFromString('--no-incremental-marking --no-concurrent-recompilation');
+
 const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
 
