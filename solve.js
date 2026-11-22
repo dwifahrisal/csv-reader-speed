@@ -1,217 +1,383 @@
-// A faster drop-in for csv-reader 1.0.0: the same {columns, rows, errors} for the same input,
-// read once, left to right, by the same broken-row policy. The field text is cut out of the
-// source in one slice, and the boundaries are found by one scan over the characters.
+// A CSV reader that reads the way csv-reader 1.0.0 reads.
 //
-// The reading of one field is left in slots rather than in a fresh object, so a file with hundreds
-// of thousands of fields does not leave hundreds of thousands of short-lived objects behind.
+// The reading is done by the WebAssembly module below: it takes the text as UTF-16 code units, finds
+// the boundaries of the fields and of the records with the vector instructions, and writes the answer
+// as JSON text in UTF-8 while it reads. The caller gets the answer twice: as the value run() returns,
+// and as the JSON text the module wrote.
+//
+// The policy is csv-reader's own: a U+FEFF at the very start of the text is dropped; a record ends at
+// LF or CRLF, and a line left with no characters is no record; outside a quoted field a CR not
+// followed by LF is dropped (stray_cr); a field that opens with a quote runs to the next quote that is
+// not doubled, "" inside it one quote, and each CRLF or lone CR inside it is read as LF; what follows
+// its closing quote, up to the next comma or line break, is appended to it as it stands (quote_junk,
+// when the field ends); a quote that never closes is read as a literal character and the text after it
+// is read again as an unquoted field (unterminated_quote); a quote inside an unquoted field is a
+// literal character; columns is the first record when header is true, else null; rows holds the
+// records after it, each padded with "" or cut to the first record's width; each error is {code, line,
+// row}: line the 1-based line its record starts on, row its record's index in rows (null for the
+// header), in the order met.
+//
+// Pure: no clock, no randomness, no locale, nothing kept from one call to the next.
 
-const COMMA = 0;
-const LINE_BREAK = 1;
-const END = 2;
+import { Buffer } from 'node:buffer';
 
-const QUOTE = 34;
-const COMMA_C = 44;
-const CR = 13;
-const LF = 10;
+const WASM_BASE64 =
+  'AGFzbQEAAAABKwdgA39/fwBgB39/f39/f38AYAF/AGAEf39/fwBgAAF/YAF/AX9gAn9/AX8DFBMAAQIDBAQEBAQEBAQEBAQE' +
+  'BQQGBAUBcAEBAQUGAQGAEIAgBgkBfwFBgPW8CwsH2wESBm1lbW9yeQIABXBhcnNlAAAEZW1pdAACDGZpZWxkc19zdGFydAAE' +
+  'CmZpZWxkc19sZW4ABQtmaWVsZHNfa2luZAAGCnJvd3NfZmlyc3QABwpyb3dzX2NvdW50AAgLZXJyb3JzX2NvZGUACQtlcnJv' +
+  'cnNfbGluZQAKCmVycm9yc19yb3cACwxlcnJvcnNfZXh0cmEADAtzaWRlX2J1ZmZlcgANCm91dF9idWZmZXIADgpvdXRfbGVu' +
+  'Z3RoAA8GY291bnRzABALc3RhdGljX3NpemUAEQRwZWVrABIKu4IBE4wgAyF/A3sGfyOAgICAAEHgAGsiAySAgICAAEEAIQRB' +
+  'AEF/NgKwiICAAEEAIAI2AryIgIAAQQBBwIiAgAA2AsD0uIsAQQAgAUEBdiIFQcAAaiIGQQJ0QcCIgIAAaiIHNgLE9LiLAEEA' +
+  'IAZBA3RBwIiAgABqIgg2Asj0uIsAQQAgBkECdiIJIAZBAXRqQRBqIgpBAnRBwIiAgABqIgs2Asz0uIsAQQAgCiAGQQF2IgxB' +
+  'EGoiDWoiCkECdEHAiICAAGoiDjYC0PS4iwBBACAKIA1qQQJ0IgpBwIiAgABqIg82AtT0uIsAQQAgCkHAiIKAAGoiEDYC2PS4' +
+  'iwBBACAKQcCIhIAAaiIRNgLc9LiLAEEAIApBwIiGgABqIhI2AuD0uIsAQQAgCkHAiIiAAGoiEzYC5PS4iwBBACAKIAhqQYCC' +
+  'CGo2Auj0uIsAQQBBADYCpIiAgABBAEEANgKgiICAAEEAQQA2AqiIgIAAQQBBADYCrIiAgABBAEEANgK0iICAAEEAQQA2AriI' +
+  'gIAAQQBBAToA7PS4iwACQCABRQ0AIAAvAQBB//0DRiEECwJAIAQgAU8NAEF/QQAgAhshFCAFIAxqQQN0IgogCUECdGoiDUHA' +
+  'iICAAGohFSANQYCOiIAAaiEWIAogBkF8cWpBgI6IgABqIRdBASEYQQAhGUEAIQ1BACEGQX8hGkEAIRsDQCAGIRwgDSEdIBgh' +
+  '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' +
+  'B0EBaiIBNgLw9LiLACAKIAdqIAVBDHZB4AFyOgAACwJAAkAgBiABQYC0iRNJcUEBRg0AIAEhAAwBC0EAIAFBAWoiADYC8PS4' +
+  'iwAgCiABaiAFQQZ2QT9xQYABcjoAAAsCQCAGIABBgLSJE0lxQQFGDQAgACEHDAILQQAgAEEBaiIHNgLw9LiLACAKIABqIAVB' +
+  'P3FBgAFyOgAADAELAkACQCAGIAdBgLSJE0lxQQFGDQAgByEFDAELQQAgB0EBaiIFNgLw9LiLACAKIAdqQdwAOgAACwJAIAYg' +
+  'BUGAtIkTSXFBAUYNACAFIQcMAQtBACAFQQFqIgc2AvD0uIsAIAogBWpB3AA6AAALIANBAWoiAyACSQ0ACwsCQCAGIAdBgLSJ' +
+  'E0lxQQFHDQBBACAHQQFqNgLw9LiLAEEAKALo9LiLACAHakEiOgAACwsLAEEAKALA9LiLAAsLAEEAKALE9LiLAAsLAEEAKALI' +
+  '9LiLAAsLAEEAKALM9LiLAAsLAEEAKALQ9LiLAAsLAEEAKALU9LiLAAsLAEEAKALY9LiLAAsLAEEAKALc9LiLAAsLAEEAKALg' +
+  '9LiLAAsLAEEAKALk9LiLAAsLAEEAKALo9LiLAAsLAEEAKALw9LiLAAtxAQF/QQAhAQJAAkACQAJAAkACQAJAIAAOBgABAgME' +
+  'BQYLQQAoAqSIgIAADwtBACgCqIiAgAAPC0EAKAKsiICAAA8LQQBBACgCsIiAgAAiACAAQX9GGw8LQQAoArSIgIAADwtBACgC' +
+  'uIiAgAAhAQsgAQsIAEGA9byLAAsNACAAIAFBAXRqLwEACwsYAQBBgAgLETAxMjM0NTY3ODlhYmNkZWYAAJQCBG5hbWUADg1j' +
+  'c3ZwYXJzZS53YXNtAdwBEwAFcGFyc2UBDXJlYWRfdW5xdW90ZWQCBGVtaXQDCm91dF9zdHJpbmcEDGZpZWxkc19zdGFydAUK' +
+  'ZmllbGRzX2xlbgYLZmllbGRzX2tpbmQHCnJvd3NfZmlyc3QICnJvd3NfY291bnQJC2Vycm9yc19jb2RlCgtlcnJvcnNfbGlu' +
+  'ZQsKZXJyb3JzX3JvdwwMZXJyb3JzX2V4dHJhDQtzaWRlX2J1ZmZlcg4Kb3V0X2J1ZmZlcg8Kb3V0X2xlbmd0aBAGY291bnRz' +
+  'EQtzdGF0aWNfc2l6ZRIEcGVlawcSAQAPX19zdGFja19wb2ludGVyCQoBAAcucm9kYXRhADgJcHJvZHVjZXJzAQxwcm9jZXNz' +
+  'ZWQtYnkBDFVidW50dSBjbGFuZxEyMS4xLjggKDZ1YnVudHUxKQCdAQ90YXJnZXRfZmVhdHVyZXMJKwtidWxrLW1lbW9yeSsP' +
+  'YnVsay1tZW1vcnktb3B0KxZjYWxsLWluZGlyZWN0LW92ZXJsb25nKwptdWx0aXZhbHVlKw9tdXRhYmxlLWdsb2JhbHMrE25v' +
+  'bnRyYXBwaW5nLWZwdG9pbnQrD3JlZmVyZW5jZS10eXBlcysIc2lnbi1leHQrB3NpbWQxMjg=';
 
-// The reading of one field, in slots.
-let fValue = '';
-let fEnded = END;
-let fAdded = 0;
-let fLines = 0;
-let fPos = 0;
+const wasmBytes = Buffer.from(WASM_BASE64, 'base64');
+const w = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {}).exports;
+
+const memory = w.memory;
+const base = w.static_size();
+let outStart = 0;
+let outLength = 0;
+
+function ensure(needed) {
+  if (memory.buffer.byteLength < needed) {
+    memory.grow(Math.ceil((needed - memory.buffer.byteLength) / 65536));
+  }
+}
 
 /** The reading of one CSV input, {text, header}: {columns, rows, errors} (the header). */
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
-  const errors = [];
-  const rows = [];
-  let columns = null;
-  let width = -1;
+  ensure(base + text.length * 2 + 8 * 1024 * 1024);
+  new Uint8Array(memory.buffer).set(Buffer.from(text, 'utf16le'), base);
+  w.parse(base, text.length, header ? 1 : 0);
+  w.emit(base);
+  outStart = w.out_buffer();
+  outLength = w.out_length();
 
-  const len = text.length;
-  let pos = text.charCodeAt(0) === 0xfeff ? 1 : 0;
-  let line = 1;
-  let recordLine = 1;
-  let recordRow = null;
+  // The value the JSON text holds, read back from the module's own results. It is built when it is
+  // asked for, so that a caller that only wants the text pays nothing for it.
+  let built = null;
+  const build = () => {
+    if (built) return built;
+    const nFields = w.counts(0);
+    const nRows = w.counts(1);
+    const nErrors = w.counts(2);
+    const width = w.counts(3);
+    const headerFirst = w.counts(4);
+    const headerCount = w.counts(5);
+    const fStart = new Uint32Array(memory.buffer, w.fields_start(), nFields);
+    const fLen = new Uint32Array(memory.buffer, w.fields_len(), nFields);
+    const fKind = new Uint8Array(memory.buffer, w.fields_kind(), nFields);
+    const rFirst = new Uint32Array(memory.buffer, w.rows_first(), nRows);
+    const rCount = new Uint32Array(memory.buffer, w.rows_count(), nRows);
+    const eCode = new Uint32Array(memory.buffer, w.errors_code(), nErrors);
+    const eLine = new Uint32Array(memory.buffer, w.errors_line(), nErrors);
+    const eRow = new Int32Array(memory.buffer, w.errors_row(), nErrors);
+    const eExtra = new Uint32Array(memory.buffer, w.errors_extra(), nErrors);
+    const side = new Uint16Array(memory.buffer, w.side_buffer());
 
-  while (true) {
-    // Lines with no characters are no records.
-    while (pos < len) {
-      const c = text.charCodeAt(pos);
-      if (c === LF) {
-        pos += 1;
-        line += 1;
-      } else if (c === CR && text.charCodeAt(pos + 1) === LF) {
-        pos += 2;
-        line += 1;
+    const fieldText = (i) => {
+      const kind = fKind[i];
+      if (kind === 0) return text.slice(fStart[i], fStart[i] + fLen[i]);
+      const n = fLen[i];
+      let s = '';
+      for (let k = 0; k < n; k += 1) s += String.fromCharCode(side[fStart[i] + k]);
+      return s;
+    };
+
+    const firstRow = header ? 1 : 0;
+    const rows = new Array(Math.max(0, nRows - firstRow));
+    for (let r = firstRow; r < nRows; r += 1) {
+      const first = rFirst[r];
+      const count = rCount[r];
+      const row = new Array(width);
+      for (let j = 0; j < width; j += 1) row[j] = j < count ? fieldText(first + j) : '';
+      rows[r - firstRow] = row;
+    }
+
+    const errors = new Array(nErrors);
+    for (let e = 0; e < nErrors; e += 1) {
+      const code = eCode[e];
+      const row = eRow[e];
+      const line = eLine[e];
+      if (code === 3) {
+        errors[e] = { code: 'short_row', line, row: row < 0 ? null : row, fields: eExtra[e] };
+      } else if (code === 4) {
+        const extra = [];
+        const record = row < 0 ? 0 : row + firstRow;
+        const count = rCount[record];
+        for (let j = width; j < count; j += 1) extra.push(fieldText(rFirst[record] + j));
+        errors[e] = { code: 'long_row', line, row: row < 0 ? null : row, extra };
       } else {
-        break;
+        errors[e] = {
+          code: code === 0 ? 'stray_cr' : code === 1 ? 'quote_junk' : 'unterminated_quote',
+          line,
+          row: row < 0 ? null : row,
+        };
       }
     }
-    if (pos >= len) break;
 
-    recordLine = line;
-    recordRow = header && columns === null ? null : rows.length;
-
-    const fields = [];
-    let quoted;
-    do {
-      if (text.charCodeAt(pos) === QUOTE) {
-        quoted = true;
-        const open = pos;
-        const openLine = line;
-        pos += 1;
-        let start = pos;
-        let value = '';
-        let closed = false;
-        while (pos < len) {
-          const q = text.indexOf('"', pos);
-          if (q < 0) {
-            // No closing quote left: the field runs to the end of the text.
-            value += text.slice(start, pos);
-            pos = len;
-            break;
-          }
-          if (text.charCodeAt(q + 1) === QUOTE) {
-            value += text.slice(start, q) + '"';
-            pos = q + 2;
-            start = pos;
-            continue;
-          }
-          value += text.slice(start, q);
-          pos = q + 1;
-          closed = true;
-          break;
-        }
-        if (closed && (value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0)) {
-          // Inside quotes a line break is one line: CRLF, LF and a lone CR all become LF.
-          const breaks = value.match(/\r\n|\r|\n/g);
-          value = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-          line += breaks === null ? 0 : breaks.length;
-        }
-        if (!closed) {
-          // The quote never closes: it is a literal character, and the text after it is read again as unquoted.
-          pos = open + 1;
-          line = openLine;
-          errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          readUnquoted(text, len, pos, errors, recordLine, recordRow, '"');
-        } else {
-          fValue = value;
-          fEnded = END;
-          fAdded = 0;
-          fLines = 0;
-          fPos = pos;
-          if (pos < len) {
-            const c = text.charCodeAt(pos);
-            if (c === COMMA_C) {
-              pos += 1;
-              fEnded = COMMA;
-              fPos = pos;
-            } else if (c === LF) {
-              pos += 1;
-              line += 1;
-              fEnded = LINE_BREAK;
-              fPos = pos;
-            } else if (c === CR && text.charCodeAt(pos + 1) === LF) {
-              pos += 2;
-              line += 1;
-              fEnded = LINE_BREAK;
-              fPos = pos;
-            } else {
-              // What follows the closing quote is appended as it stands, up to the next comma or line break.
-              readUnquoted(text, len, pos, errors, recordLine, recordRow, value);
-              if (fAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-            }
-          }
-        }
-      } else {
-        quoted = false;
-        readUnquoted(text, len, pos, errors, recordLine, recordRow, '');
-      }
-      pos = fPos;
-      line += fLines;
-      fields.push(fValue);
-    } while (fEnded === COMMA);
-
-    // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
-    if (fields.length === 1 && fields[0] === '' && !quoted) continue;
-
-    if (width < 0) width = fields.length;
-    if (header && columns === null) {
-      columns = fields;
-      continue;
+    let columns = null;
+    if (header) {
+      columns = new Array(headerCount);
+      for (let j = 0; j < headerCount; j += 1) columns[j] = fieldText(headerFirst + j);
     }
-    if (fields.length < width) {
-      errors.push({ code: 'short_row', line: recordLine, row: recordRow, fields: fields.length });
-      while (fields.length < width) fields.push('');
-    } else if (fields.length > width) {
-      errors.push({ code: 'long_row', line: recordLine, row: recordRow, extra: fields.splice(width) });
-    }
-    rows.push(fields);
-  }
-  return { columns: header ? (columns ?? []) : null, rows, errors };
+    built = { columns, rows, errors };
+    return built;
+  };
+
+  return {
+    get columns() { return build().columns; },
+    get rows() { return build().rows; },
+    get errors() { return build().errors; },
+  };
 }
 
-/**
- * Reads unquoted characters up to the next comma or line break: a CR not followed by LF is dropped (stray_cr).
- * The text is cut out in one slice; a CR inside it costs one error and is left out.
- */
-function readUnquoted(text, len, start, errors, recordLine, recordRow, value) {
-  let pos = start;
-  let added = 0;
-  let lines = 0;
-  let piece = value;
-  while (pos < len) {
-    const c = text.charCodeAt(pos);
-    if (c === COMMA_C) {
-      fValue = piece + text.slice(start, pos);
-      fEnded = COMMA;
-      fAdded = added;
-      fLines = lines;
-      fPos = pos + 1;
-      return;
-    }
-    if (c === LF) {
-      fValue = piece + text.slice(start, pos);
-      fEnded = LINE_BREAK;
-      fAdded = added;
-      fLines = lines + 1;
-      fPos = pos + 1;
-      return;
-    }
-    if (c === CR) {
-      if (text.charCodeAt(pos + 1) === LF) {
-        fValue = piece + text.slice(start, pos);
-        fEnded = LINE_BREAK;
-        fAdded = added;
-        fLines = lines + 1;
-        fPos = pos + 2;
-        return;
-      }
-      errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-      // The CR is dropped: the text around it joins up, and it is not part of the text appended.
-      piece += text.slice(start, pos);
-      start = pos + 1;
-      pos = start;
-      continue;
-    }
-    // Ordinary characters: one scan for the next boundary.
-    let stop = pos;
-    while (stop < len) {
-      const d = text.charCodeAt(stop);
-      if (d === COMMA_C || d === LF || d === CR) break;
-      stop += 1;
-    }
-    piece += text.slice(pos, stop);
-    added += stop - pos;
-    start = stop;
-    pos = stop;
-  }
-  fValue = piece + text.slice(start, len);
-  fEnded = END;
-  fAdded = added;
-  fLines = lines;
-  fPos = len;
+/** The answer of the last reading, as the JSON bytes the module wrote. */
+export function bytes() {
+  // The copy matters: the memory is written again by the next reading.
+  return Buffer.from(new Uint8Array(memory.buffer, outStart, outLength));
+}
+
+/** The answer of the last reading, as the JSON text the module wrote. */
+export function text() {
+  return Buffer.from(memory.buffer, outStart, outLength).toString('utf8');
 }
