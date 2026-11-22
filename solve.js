@@ -23,8 +23,16 @@ const OUT_CAP = 4 << 20;
 // The room that one case needs, for the number of fields it has.
 function roomFor(fields) {
   const cap = fields + 64;
-  return cap + cap + (cap >> 2) + 16 + (cap >> 1) + 16 + (cap >> 1) + 16
-    + 4 * 8192 + cap * 2 + 64 + (OUT_CAP >> 2) + 1024;
+  // The room the reading needs, in words:
+  //   the fields: two arrays of cap and one of a quarter of cap,
+  //   the rows: two arrays of a half of cap,
+  //   the errors: four arrays of a quarter of cap,
+  //   the side buffer: two arrays of cap,
+  //   the answer: a quarter of its own size.
+  // The floor of the room for the errors is 1024 each, so the room has to hold
+  // four of those when the fields are few.
+  const errRoom = Math.max(cap >> 2, 1024);
+  return 6 * cap + 4 * errRoom + (OUT_CAP >> 2) + 1024;
 }
 
 // The file is read as it is: no string of it is made, and the cases are read out
